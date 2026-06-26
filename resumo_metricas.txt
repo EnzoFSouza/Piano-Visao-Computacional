@@ -1,0 +1,26 @@
+RESUMO ESTATÍSTICO — SESSÃO DE CAPTURA
+=============================================
+Total de frames processados: 3009
+Duração aproximada da sessão: 97.4 s (estimada por FPS médio)
+
+-- Desempenho do pipeline --
+FPS médio:                30.90
+FPS mínimo / máximo:      1.27 / 46.54
+Tempo de frame médio:     33.74 ms
+
+-- Inferência do modelo (MediaPipe) --
+Tempo médio de inferência: 16.66 ms
+Desvio padrão:             2.81 ms
+Percentil 95 (pior caso):  20.55 ms
+
+-- Latência gesto → som --
+Notas disparadas na sessão: 137
+Latência média:             0.25 ms
+Latência mínima / máxima:   0.13 / 0.81 ms
+Desvio padrão:              0.08 ms
+
+-- Detecção de mãos / iluminação --
+Taxa de detecção de mão:   83.1%
+Brilho médio do ambiente:  156.7 / 255
+Desvio padrão do brilho:   4.5
+Correlação brilho vs. detecção de mão: -0.357
