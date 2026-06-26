@@ -18,11 +18,15 @@ Polegar: ativo quando a ponta cruza para dentro da palma (eixo X).
 Outros dedos: ativos quando ponta.y > articulação_base.y (dedo dobrado).
 """
 
+import csv
+import os
+import statistics
 import sys
 import time
 
 import cv2
 import mediapipe as mp
+import numpy as np
 from mediapipe.tasks.python import BaseOptions
 from mediapipe.tasks.python.vision import (
     HandLandmarker,
@@ -38,6 +42,17 @@ import pygame
 CAMINHO_MODELO = "hand_landmarker.task"
 COOLDOWN_NOTA  = 0.50   # segundos mínimos entre ativações da mesma nota
 DIRETORIO      = "notas_piano"
+
+# ──────────────────────────────────────────────────────────────
+# MÉTRICAS — CONFIGURAÇÃO
+# ──────────────────────────────────────────────────────────────
+# Todas as medições usam time.perf_counter() (relógio monotônico de
+# alta resolução, recomendado para benchmarking — não sofre saltos
+# por ajuste de hora do sistema, ao contrário de time.time()).
+
+LOG_METRICAS       = True
+ARQUIVO_LOG        = "metricas_piano.csv"
+JANELA_MEDIA_MOVEL = 30   # nº de frames usados para médias/HUD em tempo real
 
 # Notas por mão: landmark_id -> (nome, arquivo)
 # Usamos chaves compostas (hand, lid) internamente
@@ -71,6 +86,128 @@ HAND_CONNECTIONS = [
     (0,17),(17,18),(18,19),(19,20),
     (5,9),(9,13),(13,17),
 ]
+
+
+# ──────────────────────────────────────────────────────────────
+# COLETOR DE MÉTRICAS TÉCNICAS
+# ──────────────────────────────────────────────────────────────
+
+class ColetorMetricas:
+    """
+    Centraliza todas as medições de desempenho do pipeline:
+
+      - tempo_inferencia_ms : tempo da chamada ao HandLandmarker
+                              (gargalo típico do pipeline; isola o
+                              custo do modelo do custo de I/O/desenho)
+      - tempo_frame_ms      : tempo total do loop (captura + inferência
+                              + lógica de gestos + desenho) -> FPS efetivo
+      - latencia_gesto_som_ms : tempo entre o instante em que o gesto é
+                              classificado como "ativo" num frame e o
+                              instante em que pygame.Channel.play() é
+                              chamado. É a métrica mais relevante para
+                              UX: mede a responsividade real do "instrumento".
+      - brilho_medio / desvio_brilho : média e desvio padrão da escala
+                              de cinza do frame. Proxy quantificável de
+                              "qualidade do ambiente de luz", para
+                              correlacionar com taxa_deteccao depois.
+      - mao_detectada       : booleano por frame -> taxa de detecção
+                              acumulada (robustez do modelo na sessão).
+
+    Os dados são acumulados em deques de tamanho fixo para exibir
+    médias móveis no HUD, e cada frame é também persistido em CSV
+    (se LOG_METRICAS=True) para análise posterior (ex. pandas/matplotlib
+    no relatório: latência vs. brilho, FPS vs. nº de mãos na cena etc.).
+    """
+
+    def __init__(self, janela=JANELA_MEDIA_MOVEL, arquivo_log=ARQUIVO_LOG, ativar_log=LOG_METRICAS):
+        self.janela = janela
+        self.tempos_inferencia = []
+        self.tempos_frame = []
+        self.latencias_gesto_som = []
+        self.frames_totais = 0
+        self.frames_com_mao = 0
+
+        self.ativar_log = ativar_log
+        self._writer = None
+        self._arquivo = None
+        if self.ativar_log:
+            novo = not os.path.exists(arquivo_log)
+            self._arquivo = open(arquivo_log, "a", newline="")
+            self._writer = csv.writer(self._arquivo)
+            if novo:
+                self._writer.writerow([
+                    "frame", "timestamp_unix",
+                    "tempo_inferencia_ms", "tempo_frame_ms", "fps_instantaneo",
+                    "mao_detectada", "n_maos", "brilho_medio", "desvio_brilho",
+                    "nota_disparada", "latencia_gesto_som_ms",
+                ])
+
+    # ---- registro por frame ----
+    def registrar_frame(self, tempo_inferencia_s, tempo_frame_s,
+                         mao_detectada, n_maos, brilho_medio, desvio_brilho,
+                         nota_disparada="", latencia_gesto_som_s=None):
+        self.frames_totais += 1
+        if mao_detectada:
+            self.frames_com_mao += 1
+
+        t_inf_ms   = tempo_inferencia_s * 1000.0
+        t_frame_ms = tempo_frame_s * 1000.0
+        fps_inst   = (1.0 / tempo_frame_s) if tempo_frame_s > 0 else 0.0
+
+        self.tempos_inferencia.append(t_inf_ms)
+        self.tempos_frame.append(t_frame_ms)
+        if len(self.tempos_inferencia) > self.janela:
+            self.tempos_inferencia.pop(0)
+            self.tempos_frame.pop(0)
+
+        lat_ms = ""
+        if latencia_gesto_som_s is not None:
+            lat_ms = latencia_gesto_som_s * 1000.0
+            self.latencias_gesto_som.append(lat_ms)
+            if len(self.latencias_gesto_som) > self.janela:
+                self.latencias_gesto_som.pop(0)
+
+        if self._writer:
+            self._writer.writerow([
+                self.frames_totais, time.time(),
+                f"{t_inf_ms:.3f}", f"{t_frame_ms:.3f}", f"{fps_inst:.2f}",
+                int(mao_detectada), n_maos,
+                f"{brilho_medio:.2f}", f"{desvio_brilho:.2f}",
+                nota_disparada, f"{lat_ms:.3f}" if lat_ms != "" else "",
+            ])
+
+    # ---- agregados para HUD em tempo real ----
+    def media_inferencia_ms(self):
+        return statistics.mean(self.tempos_inferencia) if self.tempos_inferencia else 0.0
+
+    def fps_medio(self):
+        if not self.tempos_frame:
+            return 0.0
+        media_ms = statistics.mean(self.tempos_frame)
+        return 1000.0 / media_ms if media_ms > 0 else 0.0
+
+    def media_latencia_gesto_som_ms(self):
+        return statistics.mean(self.latencias_gesto_som) if self.latencias_gesto_som else 0.0
+
+    def taxa_deteccao_mao(self):
+        if self.frames_totais == 0:
+            return 0.0
+        return 100.0 * self.frames_com_mao / self.frames_totais
+
+    def fechar(self):
+        if self._arquivo:
+            self._arquivo.close()
+
+
+def medir_brilho(frame_bgr):
+    """
+    Converte para escala de cinza e retorna (média, desvio padrão).
+    Média alta = ambiente claro; desvio alto = boa separação mão/fundo
+    (mais contraste). Útil para correlacionar qualidade de detecção
+    com condições de iluminação em diferentes ambientes de teste.
+    """
+    cinza = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    return float(np.mean(cinza)), float(np.std(cinza))
 
 
 # ──────────────────────────────────────────────────────────────
@@ -185,6 +322,31 @@ def desenhar_hud(frame, notas_ativas_chaves):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, cor, 1)
 
 
+def desenhar_hud_metricas(frame, coletor, brilho_medio, n_maos):
+    """
+    HUD técnico no topo da tela: FPS médio, tempo de inferência do
+    modelo, latência gesto->som e taxa de detecção de mãos na sessão.
+    Pensado para aparecer em prints/vídeo do relatório.
+    """
+    linhas = [
+        f"FPS: {coletor.fps_medio():.1f}",
+        f"Inferencia: {coletor.media_inferencia_ms():.1f} ms",
+        f"Latencia gesto->som: {coletor.media_latencia_gesto_som_ms():.1f} ms",
+        f"Deteccao de mao (sessao): {coletor.taxa_deteccao_mao():.1f}%",
+        f"Brilho medio: {brilho_medio:.0f}/255   Maos no frame: {n_maos}",
+    ]
+
+    x, y = 10, 55
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 40), (430, 40 + 20 * len(linhas) + 10), (15, 15, 15), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+
+    for linha in linhas:
+        cv2.putText(frame, linha, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
+                    (0, 230, 255), 1, cv2.LINE_AA)
+        y += 20
+
+
 # ──────────────────────────────────────────────────────────────
 # PROGRAMA PRINCIPAL
 # ──────────────────────────────────────────────────────────────
@@ -201,6 +363,9 @@ def main():
     # Canal dedicado por chave (hand, lid)
     canais = {chave: pygame.mixer.Channel(i) for i, chave in enumerate(NOTAS_MAO)}
     ultimo_toque = {chave: 0.0 for chave in NOTAS_MAO}
+
+    coletor = ColetorMetricas()
+    print(f"Métricas sendo registradas em '{ARQUIVO_LOG}'." if LOG_METRICAS else "Log de métricas desativado.")
 
     options = HandLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=CAMINHO_MODELO),
@@ -229,6 +394,8 @@ def main():
 
     with HandLandmarker.create_from_options(options) as landmarker:
         while True:
+            t_inicio_frame = time.perf_counter()
+
             ret, frame = cap.read()
             if not ret:
                 break
@@ -239,9 +406,15 @@ def main():
             mp_image  = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
             timestamp = int((frame_idx / fps_cam) * 1000)
 
-            resultado           = landmarker.detect_for_video(mp_image, timestamp)
+            brilho_medio, desvio_brilho = medir_brilho(frame)
+
+            t_antes_inferencia = time.perf_counter()
+            resultado          = landmarker.detect_for_video(mp_image, timestamp)
+            t_inferencia       = time.perf_counter() - t_antes_inferencia
+
             notas_ativas_chaves = set()
             agora               = time.time()
+            t_gesto_detectado   = time.perf_counter()  # marca p/ latência gesto->som
 
             if resultado.hand_landmarks:
                 for idx_mao, hand_lms in enumerate(resultado.hand_landmarks):
@@ -267,14 +440,34 @@ def main():
                                 desenhar_ponta_ativa(frame, hand_lms, ponta_id)
 
             # Tocar notas ativas com cooldown
+            nota_disparada_neste_frame = ""
+            latencia_gesto_som = None
             for chave in notas_ativas_chaves:
                 if agora - ultimo_toque[chave] >= COOLDOWN_NOTA:
                     canais[chave].play(sons[chave])
+                    latencia_gesto_som = time.perf_counter() - t_gesto_detectado
                     ultimo_toque[chave] = agora
                     nome, _ = NOTAS_MAO[chave]
-                    print(f"  ♪ {nome} ({chave[0]})")
+                    nota_disparada_neste_frame = nome
+                    print(f"  ♪ {nome} ({chave[0]})  [latência gesto→som: {latencia_gesto_som*1000:.1f} ms]")
 
             desenhar_hud(frame, notas_ativas_chaves)
+
+            n_maos_no_frame = len(resultado.hand_landmarks) if resultado.hand_landmarks else 0
+            tempo_frame_total = time.perf_counter() - t_inicio_frame
+
+            coletor.registrar_frame(
+                tempo_inferencia_s=t_inferencia,
+                tempo_frame_s=tempo_frame_total,
+                mao_detectada=n_maos_no_frame > 0,
+                n_maos=n_maos_no_frame,
+                brilho_medio=brilho_medio,
+                desvio_brilho=desvio_brilho,
+                nota_disparada=nota_disparada_neste_frame,
+                latencia_gesto_som_s=latencia_gesto_som,
+            )
+
+            desenhar_hud_metricas(frame, coletor, brilho_medio, n_maos_no_frame)
 
             cv2.putText(frame, "Q = sair", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1)
@@ -286,6 +479,16 @@ def main():
     cap.release()
     cv2.destroyAllWindows()
     pygame.quit()
+    coletor.fechar()
+
+    print("\n── Resumo da sessão ──")
+    print(f"  Frames processados:        {coletor.frames_totais}")
+    print(f"  Taxa de detecção de mão:   {coletor.taxa_deteccao_mao():.1f}%")
+    print(f"  FPS médio:                 {coletor.fps_medio():.1f}")
+    print(f"  Inferência média (modelo): {coletor.media_inferencia_ms():.1f} ms")
+    print(f"  Latência média gesto→som:  {coletor.media_latencia_gesto_som_ms():.1f} ms")
+    if LOG_METRICAS:
+        print(f"  Log completo salvo em:     {ARQUIVO_LOG}")
     print("Encerrado.")
 
 
